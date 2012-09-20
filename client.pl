@@ -12,34 +12,23 @@ my $socket = IO::Socket::INET->new(
     PeerAddr => $host,
     PeerPort => 10001,
     Proto => 'tcp',
-    Blocking => 1,
 ) or die "could not open socket: $!";
 
-while($socket->connected) {
-    if(send($socket, "ping\n", 0)) {
-        my $tmp = undef;
-        my $buf = undef;
-        my $buf_sz = 512;
+my $tmp = undef;
+my $buf = undef;
+my $buf_sz = 512;
 
-        say 'ping';
+while(my $sz = read $socket, $tmp, $buf_sz) {
+    last unless($sz);
 
-        if(IO::Select->new($socket)->can_read(.1)) {
-            while(my $sz = recv $socket, $tmp, $buf_sz, MSG_DONTWAIT) {
-                last unless($sz);
+    print STDERR "sz: $sz\n";
 
-                print STDERR "sz: $sz\n";
+    $buf .= $tmp;
 
-                $buf .= $tmp;
+    next if($sz == $buf_sz);
 
-                next if($sz == $buf_sz);
-
-                print "response: $buf\n";
-                $tmp = '';
-            }
-        }
-    }
-
-    Time::HiRes::usleep(100_000);
+    print "response: $buf\n";
+    $tmp = '';
 }
 
 close($socket);

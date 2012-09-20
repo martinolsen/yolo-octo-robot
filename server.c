@@ -7,12 +7,14 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <errno.h>
 
 #define LISTEN_BACKLOG  50
 #define LISTEN_PORT     10001
 #define BUF_SIZE        128
 #define BUF_MAX         (1024 * 1024)
 #define REAP_INTERVAL   10
+#define SEND_INTERVAL   2
 
 typedef struct message_t {
     struct message_t *prev, *next;
@@ -30,9 +32,11 @@ typedef struct client_t {
     int sockfd;
     struct sockaddr *addr;
     socklen_t *socklen;
-    pthread_t tid;
-    message_t *last_message;
+    size_t mstr_idx;
+    message_t *message, *last_message;
     int is_sender;
+    ssize_t rbuf_idx, rbuf_sz;
+    char *rbuf;
 } client_t;
 
 static pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -40,12 +44,18 @@ static pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
 client_t *first_client = NULL;
 client_t *last_client = NULL;
 
-void create_message(char *str, size_t len) {
+size_t fd_client_index_limit = 0;
+client_t **fd_client_index = NULL;
+
+pthread_t reader_tid;
+pthread_t writer_tid;
+
+message_t *create_message(char *str, size_t len) {
     message_t *message = malloc(sizeof(message_t));
 
     if(message == NULL) {
         perror("calloc(message_t)");
-        return;
+        return NULL;
     }
 
     message->len = len;
@@ -74,7 +84,7 @@ void create_message(char *str, size_t len) {
         exit(EXIT_FAILURE);
     }
 
-    fprintf(stderr, "created message \"%s\"\n", message->str);
+    return message;
 }
 
 void message_list_del(message_t *message) {
@@ -132,7 +142,7 @@ void reap_messages(void) {
         client_t *client = first_client;
 
         while(client) {
-            if(message == client->last_message)
+            if(message == client->message || message == client->last_message)
                 return;
 
             client = client->next;
@@ -208,8 +218,10 @@ void kill_client(client_t *client) {
 
     client_list_del(client);
 
-    if(client->sockfd)
+    if(client->sockfd) {
+        fd_client_index[client->sockfd] = NULL;
         close(client->sockfd);
+    }
 
     if(client->addr)
         free(client->addr);
@@ -217,110 +229,148 @@ void kill_client(client_t *client) {
     free(client);
 }
 
-int sock_write(int sockfd, char *buf, size_t len) {
-    size_t write_sz, buf_idx = 0;
+int send_pending_messages(client_t *client) {
+    message_t *message = client->message;
+    int count = 0;
 
-    while((write_sz = send(sockfd, buf + buf_idx, len - buf_idx, 0)) > 0) {
-        buf_idx += write_sz;
-    }
+    /*
+    fprintf(stderr, "checking for pending message to client %p\n", (void *) client);
+    */
 
-    return 0;
-}
-
-void send_pending_messages(client_t *client) {
-    message_t *message = first_message;
-
-    if(client->last_message) {
+    if(message == NULL && client->last_message) {
         if(client->last_message->next == NULL)
-            return;
+            return count;
 
         message = client->last_message->next;
+        client->mstr_idx = 0;
+    }
+
+    if(message == NULL) {
+        message = first_message;
+        client->mstr_idx = 0;
     }
 
     while(message) {
+        size_t write_sz = 0;
+
         fprintf(stderr, "sending message %p to client\n", (void *)message);
 
-        sock_write(client->sockfd, message->str, message->len);
+        client->message = message;
+
+        while(client->mstr_idx < message->len) {
+            write_sz = send(client->sockfd, message->str + client->mstr_idx, message->len - client->mstr_idx, MSG_DONTWAIT | MSG_NOSIGNAL);
+
+            if(write_sz == -1)
+                break;
+
+            fprintf(stderr, "wrote %lu+%lu/%lu bytes of message %p to client %p\n", client->mstr_idx, write_sz, message->len, (void *) message, (void *) client);
+
+            client->mstr_idx += write_sz;
+
+            if(client->mstr_idx >= message->len)
+                break;
+        }
+
+        if(write_sz == -1 && errno == EAGAIN)
+            break;
+
+        if(write_sz == -1) {
+            perror("send()");
+            kill_client(client);
+            pthread_exit((void *) 0);
+            return count;
+        }
 
         client->last_message = message;
-        message = message->next;
+        client->message = message = message->next;
+        client->mstr_idx = 0;
+
+        count++;
     }
+
+    return count;
 }
 
-void *handle(void *arg) {
-    client_t *client = arg;
-    ssize_t read_sz, buf_idx = 0, buf_sz = BUF_SIZE;
-    char *buf = malloc(buf_sz);
+void client_read(client_t *client) {
+    ssize_t read_sz;
 
-    if(buf == NULL) {
-        perror("malloc()");
-        kill_client(client);
-        return((void *) 0);
+    if(client->rbuf == NULL) {
+        client->rbuf_idx = 0;
+        client->rbuf_sz = BUF_SIZE;
+
+        client->rbuf = malloc(client->rbuf_sz);
+        if(client->rbuf == NULL) {
+            perror("malloc()");
+            kill_client(client);
+            pthread_exit((void *) 0);
+        }
     }
 
-    while((read_sz = recv(client->sockfd, buf + buf_idx, buf_sz - buf_idx, 0)) > 0) {
-        /*fprintf(stderr, "received %lu+%lu bytes from client\n", read_sz, buf_idx);*/
+    while((read_sz = recv(client->sockfd, client->rbuf + client->rbuf_idx, client->rbuf_sz - client->rbuf_idx, MSG_DONTWAIT | MSG_NOSIGNAL)) > 0) {
+        fprintf(stderr, "received %lu+%lu bytes from client %p\n", read_sz, client->rbuf_idx, (void *) client);
 
-        buf_idx += read_sz;
+        client->rbuf_idx += read_sz;
 
         /* is buffer full */
-        if(buf_idx == buf_sz) {
-            buf_sz *= 2;
+        if(client->rbuf_idx == client->rbuf_sz) {
+            client->rbuf_sz *= 2;
 
-            if(buf_sz > BUF_MAX) {
-                fprintf(stderr, "buffer overflow, discarding message and disconnecting client\n");
+            if(client->rbuf_sz > BUF_MAX) {
+                fprintf(stderr, "buffer overflow, discarding message\n");
 
-                free(buf);
-                kill_client(client);
-                return((void *) 0);
+                free(client->rbuf);
+                return;
             }
 
             /*fprintf(stderr, "increasing message buffer size to %lu\n", buf_sz);*/
-            buf = realloc(buf, buf_sz);
+            client->rbuf = realloc(client->rbuf, client->rbuf_sz);
 
-            if(buf == NULL) {
+            if(client->rbuf == NULL) {
                 perror("realloc()");
-                kill_client(client);
-                return((void *) 0);
+                return;
             }
 
             continue;
         }
 
         /* message is complete */
-        if(buf[0] == '!') {
-            if(client->is_sender) {
-                create_message(buf + 1, buf_idx - 1);
-            } else {
-                fprintf(stderr, "client is not allowed to send messages!\n");
-            }
-        } else if(strncmp(buf, "ping\n", 5) == 0) {
-            /* ping! */
+        if(client->is_sender) {
+            message_t *message = create_message(client->rbuf, client->rbuf_idx);
+
+            if(message)
+                fprintf(stderr, "created new message %p (length: %lu) from client %p\n", (void *) message, message->len, (void *) client);
         } else {
-            fprintf(stderr, "Unknown message: %s\n", buf);
+            fprintf(stderr, "client is not allowed to send messages!\n");
         }
 
-        buf_idx = 0;
-
-        send_pending_messages(client);
+        client->rbuf_idx = 0;
     }
 
-    free(buf);
-
-    fprintf(stderr, "client disconnected!\n");
+    if(read_sz == -1 && errno == EAGAIN)
+        return;
 
     if(read_sz == -1) {
         perror("read()");
+        kill_client(client);
+        pthread_exit((void *) 0);
     }
-
-    kill_client(client);
-
-    return((void *) 0);
 }
 
 void create_client(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen) {
     char addrstr[INET6_ADDRSTRLEN];
-    client_t *client = calloc(1, sizeof(client_t));
+    client_t *client;
+
+    if(sockfd > fd_client_index_limit) {
+        fprintf(stderr, "cannot create any more clients (sockfd > _SO_OPEN_MAX)!\n");
+        return;
+    }
+
+    if(fd_client_index[sockfd]) {
+        fprintf(stderr, "FD/client index inconsistent (already set)!\n");
+        return;
+    }
+
+    client = calloc(1, sizeof(client_t));
     if(client == NULL) {
         perror("calloc()");
         close(sockfd);
@@ -347,15 +397,12 @@ void create_client(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen) {
     memcpy(client->addr, addr, *addrlen);
 
     client->is_sender = 1;
-    client->last_message = first_message;
+    client->message = first_message;
+    client->last_message = NULL;
 
     client_list_add(client);
 
-    if(pthread_create(&client->tid , NULL, &handle, client) != 0) {
-        perror("pthread_create()");
-        kill_client(client);
-        return;
-    }
+    fd_client_index[sockfd] = client;
 }
 
 void serve(int serverfd) {
@@ -393,9 +440,125 @@ void serve(int serverfd) {
     }
 }
 
+#undef min
+#define min(x, y) ((x) < (y) ? (x) : (y))
+
+#undef max
+#define max(x, y) ((x) > (y) ? (x) : (y))
+
+void *reader(void *arg) {
+    struct timeval timeout;
+
+    while(1) {
+        fd_set fds;
+        int r, nfds;
+        size_t i;
+
+        FD_ZERO(&fds);
+
+        for(i = 0; i < fd_client_index_limit; i++) {
+            if(fd_client_index[i]) {
+                FD_SET(i, &fds);
+                nfds = max(nfds, i);
+            }
+        }
+
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+
+        r = select(nfds + 1, &fds, NULL, NULL, &timeout);
+
+        if(r == -1 && errno == EINTR)
+            continue;
+
+        if(r == -1) {
+            perror("select()");
+            exit(EXIT_FAILURE);
+        }
+
+        for(i = 0; i < fd_client_index_limit; i++) {
+            if(FD_ISSET(i, &fds)) {
+                client_read(fd_client_index[i]);
+            }
+        }
+
+        sleep(1);
+    }
+}
+
+void create_reader(void) {
+    fd_client_index_limit = min(sysconf(_SC_OPEN_MAX), FD_SETSIZE);
+
+    fprintf(stderr, "Allocating %lu bytes for FD/client index!\n", fd_client_index_limit * sizeof(client_t *));
+
+    fd_client_index = calloc(sysconf(_SC_OPEN_MAX), sizeof(client_t *));
+    if(fd_client_index == NULL) {
+        perror("calloc()");
+        exit(EXIT_FAILURE);
+    }
+
+    if(pthread_create(&reader_tid, NULL, &reader, NULL) != 0) {
+        perror("pthread_create()");
+        fprintf(stderr, "could not create reader thread\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void *writer(void *arg) {
+    struct timeval timeout;
+
+    while(1) {
+        fd_set fds;
+        int nfds, r;
+        size_t i;
+        int count = 0;
+
+        FD_ZERO(&fds);
+
+        for(i = 0; i < fd_client_index_limit; i++) {
+            if(fd_client_index[i]) {
+                FD_SET(i, &fds);
+                nfds = max(nfds, i);
+            }
+        }
+
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 200000;
+
+        r = select(nfds + 1, NULL, &fds, NULL, &timeout);
+
+        if(r == -1 && errno == EINTR)
+            continue;
+
+        if(r == -1) {
+            perror("select()");
+            exit(EXIT_FAILURE);
+        }
+
+        for(i = 0; i < fd_client_index_limit; i++) {
+            if(FD_ISSET(i, &fds))
+                count += send_pending_messages(fd_client_index[i]);
+        }
+
+        if(count == 0)
+            sleep(1);
+    }
+}
+
+void create_writer(void) {
+    if(pthread_create(&writer_tid, NULL, &writer, NULL) != 0) {
+        perror("pthread_create()");
+        fprintf(stderr, "could not create writer thread\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
 int main() {
     int sockfd, reuse = 1;
     struct sockaddr_in addr;
+
+    create_reader();
+    create_writer();
 
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if(sockfd == -1) {

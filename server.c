@@ -115,7 +115,7 @@ void kill_message(message_t *message) {
     if(message == NULL)
         return;
 
-    fprintf(stderr, "kill message @%p\n", message);
+    fprintf(stderr, "kill message @%p\n", (void *)message);
 
     message_list_del(message);
 
@@ -127,7 +127,6 @@ void kill_message(message_t *message) {
 
 void reap_messages(void) {
     message_t *message = first_message, *next;
-    int i = 0;
 
     while(message) {
         client_t *client = first_client;
@@ -144,10 +143,7 @@ void reap_messages(void) {
         kill_message(message);
 
         message = next;
-        i++;
     }
-
-    if(i) fprintf(stderr, "reapend %d message(s)\n", i);
 }
 
 void client_list_add(client_t *client) {
@@ -224,8 +220,6 @@ void kill_client(client_t *client) {
 int sock_write(int sockfd, char *buf, size_t len) {
     size_t write_sz, buf_idx = 0;
 
-    fprintf(stderr, "writing \"%s\" to socket\n", buf);
-
     while((write_sz = send(sockfd, buf + buf_idx, len - buf_idx, 0)) > 0) {
         buf_idx += write_sz;
     }
@@ -244,6 +238,8 @@ void send_pending_messages(client_t *client) {
     }
 
     while(message) {
+        fprintf(stderr, "sending message %p to client\n", (void *)message);
+
         sock_write(client->sockfd, message->str, message->len);
 
         client->last_message = message;
@@ -279,7 +275,7 @@ void *handle(void *arg) {
                 return((void *) 0);
             }
 
-            fprintf(stderr, "increasing message buffer size to %lu\n", buf_sz);
+            /*fprintf(stderr, "increasing message buffer size to %lu\n", buf_sz);*/
             buf = realloc(buf, buf_sz);
 
             if(buf == NULL) {
@@ -294,7 +290,7 @@ void *handle(void *arg) {
         /* message is complete */
         if(buf[0] == '!') {
             if(client->is_sender) {
-                create_message(buf, buf_idx - 1);
+                create_message(buf + 1, buf_idx - 1);
             } else {
                 fprintf(stderr, "client is not allowed to send messages!\n");
             }
@@ -367,7 +363,6 @@ void serve(int serverfd) {
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(struct sockaddr_in);
     struct timeval timeout;
-    time_t prev_reap = time(NULL), curr_time;
 
     memset(&addr, 0, sizeof(struct sockaddr_in));
 
@@ -380,8 +375,8 @@ void serve(int serverfd) {
         if(serverfd >= maxfd)
             maxfd = serverfd + 1;
 
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 2000;
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
 
         /* listen for new clients */
         if(select(maxfd, &fds, NULL, NULL, &timeout) > 0 && FD_ISSET(serverfd, &fds)) {
@@ -394,11 +389,7 @@ void serve(int serverfd) {
             create_client(clientfd, &addr, &addrlen);
         }
 
-        curr_time = time(NULL);
-        if(prev_reap + REAP_INTERVAL > curr_time) {
-            prev_reap = curr_time;
-            reap_messages();
-        }
+        reap_messages();
     }
 }
 

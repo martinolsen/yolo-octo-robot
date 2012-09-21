@@ -1,0 +1,6 @@
+Required (remote) files
+-----------------------
+
+http://martinolsen.net/2497122/launch.jnlp
+http://martinolsen.net/2497122/client-0.0.1-SNAPSHOT.zip
+http://martinolsen.net/2497122/lib/client-0.0.1-SNAPSHOT.jar

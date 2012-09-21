@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<jnlp spec="1.0+" codebase="http://martinolsen.net/2497122" href="$outputFile">
+    <information>
+        <title>Freelance project 2497122 :: Client</title>
+        <vendor>Martin Olsen</vendor>
+    </information>
+
+    <security>
+        <all-permissions />
+    </security>
+
+    <resources>
+        <j2se version="1.5+" initial-heap-size="32m" max-heap-size="128m" />
+        <property name="jnlp.versionEnabled" value="false" />
+
+        $dependencies
+    </resources>
+
+    <application-desc main-class="$mainClass"></application-desc>
+</jnlp>
